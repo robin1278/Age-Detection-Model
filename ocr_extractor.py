@@ -2,8 +2,8 @@
 import cv2
 import json
 import numpy as np
-import pytesseract
-from PIL import Image
+import easyocr
+import math
 
 def get_all_components_info(json_data, component_label):
     components = []
@@ -12,7 +12,7 @@ def get_all_components_info(json_data, component_label):
             components.append(shape)
     return components
 
-def enhance_and_ocr(image, component_info, component_label, index):
+def straighten_and_ocr(image, component_info, component_label, index, reader):
     if component_info['shape_type'] == 'polygon':
         mask = np.zeros(image.shape[:2], dtype=np.uint8)
         points = np.array(component_info['points'], dtype=np.int32)
@@ -32,51 +32,40 @@ def enhance_and_ocr(image, component_info, component_label, index):
     else:
         return "Unsupported shape type", 0
 
-    cv2.imwrite(f"cropped_{component_label}_{index}.png", cropped_image)
+    # For component15, detect the angle of the text and rotate the image to make it horizontal
+    if component_label == 'component15':
+        gray = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        coords = np.column_stack(np.where(thresh > 0))
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
 
-    gray_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
-
-    denoised_image = cv2.medianBlur(gray_image, 3)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    contrast_image = clahe.apply(denoised_image)
-
-    scale_factor = 4
-    width = int(contrast_image.shape[1] * scale_factor)
-    height = int(contrast_image.shape[0] * scale_factor)
-    resized_image = cv2.resize(contrast_image, (width, height), interpolation=cv2.INTER_LANCZOS4)
-
-    _, preprocessed_image = cv2.threshold(resized_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Invert image only for component15
-    if component_label == "component15":
-        preprocessed_image = cv2.bitwise_not(preprocessed_image)
-
-    cv2.imwrite(f"preprocessed_{component_label}_{index}.png", preprocessed_image)
-
-    pil_img = Image.fromarray(preprocessed_image)
-
-    # Try different PSM values
-    custom_config = r'--oem 3 --psm 7' # Treat the image as a single text line.
-    if component_label == "component15":
-        custom_config = r'--oem 3 --psm 8' # Treat the image as a single word.
+        (h, w) = cropped_image.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        cropped_image = cv2.warpAffine(cropped_image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
-    ocr_data = pytesseract.image_to_data(pil_img, config=custom_config, output_type=pytesseract.Output.DICT)
+    # Perform OCR using easyocr
+    results = reader.readtext(cropped_image)
 
     text = ""
     total_confidence = 0
-    word_count = 0
-    for i in range(len(ocr_data['text'])):
-        if int(ocr_data['conf'][i]) > 0 and ocr_data['text'][i].strip() != "":
-            text += ocr_data['text'][i] + " "
-            total_confidence += int(ocr_data['conf'][i])
-            word_count += 1
+    if results:
+        for (bbox, t, prob) in results:
+            text += t + " "
+            total_confidence += prob
+        avg_confidence = total_confidence / len(results)
+    else:
+        avg_confidence = 0
 
-    avg_confidence = total_confidence / word_count if word_count > 0 else 0
-    return text.strip(), avg_confidence
+    return text.strip(), avg_confidence * 100
 
 def main():
+    reader = easyocr.Reader(['en'])
     with open('PCB_AI_TASK_page-0001.json', 'r') as f:
         json_data = json.load(f)
 
@@ -85,7 +74,7 @@ def main():
     component2_infos = get_all_components_info(json_data, 'component2')
     if component2_infos:
         for i, info in enumerate(component2_infos):
-            text, confidence = enhance_and_ocr(image, info, 'component2', i)
+            text, confidence = straighten_and_ocr(image, info, 'component2', i, reader)
             print(f"Component 2 (instance {i+1}) OCR Result: '{text}' with average confidence: {confidence:.2f}%")
     else:
         print("Component 2 not found in JSON.")
@@ -93,7 +82,7 @@ def main():
     component15_infos = get_all_components_info(json_data, 'component15')
     if component15_infos:
         for i, info in enumerate(component15_infos):
-            text, confidence = enhance_and_ocr(image, info, 'component15', i)
+            text, confidence = straighten_and_ocr(image, info, 'component15', i, reader)
             print(f"Component 15 (instance {i+1}) OCR Result: '{text}' with average confidence: {confidence:.2f}%")
     else:
         print("Component 15 not found in JSON.")
